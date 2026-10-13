@@ -21,6 +21,8 @@ from pydantic import (
 from torch import Tensor
 from torch.optim import LBFGS
 
+from heretic.ara_research import prompt_hashes, record_event, record_trial
+
 from heretic.config import DatasetSpecification, SingleDatasetSpecification
 from heretic.modifier import Context, Modifier, Serializable
 from heretic.utils import format_dataset_specification, print
@@ -50,6 +52,11 @@ class Parameters(Serializable):
 
 
 class Settings(BaseModel):
+    research_output: str | None = Field(default=None, description="Opt-in artifacts directory, relative to launch CWD.")
+    research_metadata: str | None = Field(default=None, description="JSON provenance file, relative to launch CWD.")
+    research_trial: int = Field(default=0, ge=0, description="Zero-based Optuna trial number to record.")
+    research_intermediate_module: int = Field(default=1, ge=1, description="Save intermediate after this many completed modules.")
+
     good_prompts: DatasetSpecification = Field(
         default=SingleDatasetSpecification(
             dataset="mlabonne/harmless_alpaca",
@@ -187,6 +194,8 @@ class ARA(Modifier[Parameters]):
         )
         bad_prompts = ctx.load_prompts(self.settings.bad_prompts)
         print(f"* [bold]{len(bad_prompts)}[/] prompts loaded")
+        if self.settings.research_output is not None:
+            self._research_dataset_hashes = prompt_hashes(good_prompts, bad_prompts)
 
         print()
         print("Obtaining module I/O for good prompts...")
@@ -235,7 +244,7 @@ class ARA(Modifier[Parameters]):
             15,
         )
 
-        return Parameters(
+        parameters = Parameters(
             start_layer_index=start_layer_index,
             end_layer_index=end_layer_index,
             preserve_good_behavior_weight=preserve_good_behavior_weight,
@@ -244,105 +253,116 @@ class ARA(Modifier[Parameters]):
             neighbor_count=neighbor_count,
         )
 
+        if self.settings.research_output is not None:
+            self._research_trial = (trial.number, parameters)
+        return parameters
+
     def modify_model(self, ctx: Context, parameters: Parameters) -> None:
-        model = ctx.get_model()
+        with record_trial(self, ctx, parameters) as record:
+            model = ctx.get_model()
 
-        for layer_index in range(
-            parameters.start_layer_index,
-            parameters.end_layer_index,
-        ):
-            for component, modules in model.get_layer_modules(layer_index).items():
-                for module_index, module in enumerate(modules):
-                    # Cast to Linear to access weights and LoRA adapters.
-                    module = cast(Linear, module)
+            for layer_index in range(
+                parameters.start_layer_index,
+                parameters.end_layer_index,
+            ):
+                for component, modules in model.get_layer_modules(layer_index).items():
+                    for module_index, module in enumerate(modules):
+                        if record is not None:
+                            record_event(record, "module_start", module_id=f"L{layer_index}.{component}.M{module_index}", outer_step=0)
+                        # Cast to Linear to access weights and LoRA adapters.
+                        module = cast(Linear, module)
 
-                    # We need the base weight in float32 to compute the effective weight.
-                    base_weight = cast(Tensor, module.base_layer.weight)
-                    quant_state = getattr(base_weight, "quant_state", None)
+                        # We need the base weight in float32 to compute the effective weight.
+                        base_weight = cast(Tensor, module.base_layer.weight)
+                        quant_state = getattr(base_weight, "quant_state", None)
 
-                    if quant_state is None:
-                        W_base = base_weight.to(torch.float32)
-                    else:
-                        # Use the original dequantization logic from bitsandbytes.
-                        W_base = cast(
-                            Tensor,
-                            bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
-                                base_weight.data,
-                                quant_state,
-                            ).to(torch.float32),
-                        )
-
-                    # Pre-calculate the original row norms to preserve them.
-                    # See https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration
-                    W_row_norms = cast(
-                        Tensor,
-                        LA.vector_norm(W_base, dim=1, keepdim=True).detach(),
-                    )
-
-                    # We optimize the LoRA weights A and B.
-                    lora_A = cast(Tensor, module.lora_A["default"].weight)
-                    lora_B = cast(Tensor, module.lora_B["default"].weight)
-
-                    # Move I/O tensors to the device of the adapter weights.
-                    good_input, good_output = self.good_module_io[layer_index][
-                        component
-                    ][module_index]
-                    bad_input, bad_output = self.bad_module_io[layer_index][component][
-                        module_index
-                    ]
-
-                    good_input = good_input.float().to(lora_A.device)
-                    good_output = good_output.float().to(lora_A.device)
-                    bad_input = bad_input.float().to(lora_A.device)
-                    bad_output = bad_output.float().to(lora_A.device)
-
-                    def objective(A: Tensor, B: Tensor) -> Tensor:
-                        # Calculate effective weight after applying adapter.
-                        W_eff = W_base + (B @ A)
-
-                        if self.settings.preserve_row_magnitudes:
-                            # Normalize to unit length, then scale by original norms,
-                            # preserving the original row norms.
-                            W_eff = F.normalize(W_eff, p=2, dim=1) * W_row_norms
-
-                        # Compute outputs using the effective weight.
-                        new_good_output = good_input @ W_eff.T
-                        new_bad_output = bad_input @ W_eff.T
-
-                        return ara_loss(
-                            good_output,
-                            bad_output,
-                            new_good_output,
-                            new_bad_output,
-                            parameters,
-                        )
-
-                    optimizer = LBFGS(
-                        [lora_A, lora_B],
-                        lr=self.settings.learning_rate,
-                        max_iter=self.settings.max_iter,
-                        history_size=self.settings.history_size,
-                        line_search_fn="strong_wolfe",
-                    )
-
-                    def closure() -> Tensor:
-                        optimizer.zero_grad()
-                        loss = objective(lora_A, lora_B)
-                        loss.backward()
-                        return loss
-
-                    for step in range(self.settings.n_optimization_steps):
-                        loss = optimizer.step(closure)
-                        if self.settings.print_loss:
-                            print(
-                                f"\\[{layer_index}/{component}/{module_index}] Step: {step + 1}, Loss: {loss.item():.6f}"
+                        if quant_state is None:
+                            W_base = base_weight.to(torch.float32)
+                        else:
+                            # Use the original dequantization logic from bitsandbytes.
+                            W_base = cast(
+                                Tensor,
+                                bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
+                                    base_weight.data,
+                                    quant_state,
+                                ).to(torch.float32),
                             )
 
-                    # Free the gradient buffers accumulated during optimization.
-                    # Without this, they persist on the model (one full-size gradient
-                    # per processed weight) and can easily consume tens of GB of VRAM,
-                    # causing out-of-memory errors during the subsequent evaluation.
-                    optimizer.zero_grad(set_to_none=True)
+                        # Pre-calculate the original row norms to preserve them.
+                        # See https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration
+                        W_row_norms = cast(
+                            Tensor,
+                            LA.vector_norm(W_base, dim=1, keepdim=True).detach(),
+                        )
+
+                        # We optimize the LoRA weights A and B.
+                        lora_A = cast(Tensor, module.lora_A["default"].weight)
+                        lora_B = cast(Tensor, module.lora_B["default"].weight)
+
+                        # Move I/O tensors to the device of the adapter weights.
+                        good_input, good_output = self.good_module_io[layer_index][
+                            component
+                        ][module_index]
+                        bad_input, bad_output = self.bad_module_io[layer_index][component][
+                            module_index
+                        ]
+
+                        good_input = good_input.float().to(lora_A.device)
+                        good_output = good_output.float().to(lora_A.device)
+                        bad_input = bad_input.float().to(lora_A.device)
+                        bad_output = bad_output.float().to(lora_A.device)
+
+                        def objective(A: Tensor, B: Tensor) -> Tensor:
+                            # Calculate effective weight after applying adapter.
+                            W_eff = W_base + (B @ A)
+
+                            if self.settings.preserve_row_magnitudes:
+                                # Normalize to unit length, then scale by original norms,
+                                # preserving the original row norms.
+                                W_eff = F.normalize(W_eff, p=2, dim=1) * W_row_norms
+
+                            # Compute outputs using the effective weight.
+                            new_good_output = good_input @ W_eff.T
+                            new_bad_output = bad_input @ W_eff.T
+
+                            return ara_loss(
+                                good_output,
+                                bad_output,
+                                new_good_output,
+                                new_bad_output,
+                                parameters,
+                            )
+
+                        optimizer = LBFGS(
+                            [lora_A, lora_B],
+                            lr=self.settings.learning_rate,
+                            max_iter=self.settings.max_iter,
+                            history_size=self.settings.history_size,
+                            line_search_fn="strong_wolfe",
+                        )
+
+                        def closure() -> Tensor:
+                            optimizer.zero_grad()
+                            loss = objective(lora_A, lora_B)
+                            loss.backward()
+                            return loss
+
+                        for step in range(self.settings.n_optimization_steps):
+                            loss = optimizer.step(closure)
+                            if record is not None:
+                                record_event(record, "lbfgs_outer_step_complete", outer_step=step + 1, loss=float(loss.detach()))
+                            if self.settings.print_loss:
+                                print(
+                                    f"\\[{layer_index}/{component}/{module_index}] Step: {step + 1}, Loss: {loss.item():.6f}"
+                                )
+
+                        # Free the gradient buffers accumulated during optimization.
+                        # Without this, they persist on the model (one full-size gradient
+                        # per processed weight) and can easily consume tens of GB of VRAM,
+                        # causing out-of-memory errors during the subsequent evaluation.
+                        optimizer.zero_grad(set_to_none=True)
+                        if record is not None:
+                            record_event(record, "module_complete")
 
     def reset_model(self, ctx: Context) -> None:
         model = ctx.get_model()

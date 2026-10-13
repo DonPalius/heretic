@@ -61,8 +61,9 @@ The v1 envelope follows Guardrails Lab `docs/ARTIFACT_SCHEMA.md`. It records the
 full cumulative `lora_` parameter inventory, PEFT config, base parameter fingerprint,
 model config, revisions, quantization, dtype and runtime versions. Safetensors
 stores detached copies in their original dtype; files have SHA256 and byte size.
-The adapter representation is `peft_lora`, format `safetensors`: the Lab's toy
-loader deliberately cannot replay it. Real consumer replay is PR-03, not added here.
+The adapter representation is `peft_lora`, format `safetensors`. The Lab's toy
+loader remains separate; PR-03 adds an independent Qwen2/PEFT loader. Its synthetic
+checks do not certify pretrained/A100 or cross-version runtime compatibility.
 
 Base fingerprint hashes sorted non-LoRA named parameters as float32 CPU values,
 with name/shape/float32 headers and little-endian bytes. Its explicit
@@ -112,3 +113,23 @@ name. The CPU tests compile the actual ARA method/closure/loss AST while bypassi
 unavailable unrelated imports. They are not a full import/integration test.
 Real four-A100 validation still needs logging on/off runs, intermediate live/reload
 logits, configuration and environment recording. See PR02_VALIDATION_REPORT.md.
+
+## PR-03: explicit live replay references
+
+Snapshots now record the actual `attention_implementation`. Previous snapshots
+missing this field are rejected by the real loader; regenerate them with the
+producer rather than guessing the backend. No optimizer or closure changes.
+
+`save_replay_reference(snapshot_directory, reference_directory, model, input_ids,
+attention_mask=None)` is a manual artifact helper. Call it in the producer process
+on the exact snapshot state in eval mode, using one approved unpadded input. The
+model is the live PEFT model, not the Heretic wrapper. It checks base fingerprint,
+all adapters and attention backend, then atomically saves token IDs/mask plus
+last-token full-vocabulary float32 logits (use_cache=False), bound to the exact
+snapshot manifest SHA. An already updated model is rejected.
+
+This helper is not called by ARA recording or within the closure. Intermediate
+references require access to the corresponding live boundary; references from
+the consumer's own replay are not independent evidence. Artifacts include token
+IDs, so use approved inputs. Lab commands and numerical acceptance are in its
+README and docs/PR03_REPORT.md. No pretrained reference was captured here.

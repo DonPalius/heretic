@@ -91,6 +91,7 @@ def save_snapshot(record, snapshot_id, checkpoint_kind):
                         base_state_sha256=record['base_hash'],
                         base_fingerprint_definition='sorted non-LoRA named parameters, PEFT names, float32 CPU little-endian with JSON name/shape/torch.float32 header',
                         model_config=record['model_config'],
+                        attention_implementation=record['model'].config._attn_implementation,
                         files={filename: file_record(staging / filename)},
                         adapter={'representation': 'peft_lora', 'format': 'safetensors',
                                  'tensors': {name: {'file': filename, 'shape': list(value.shape),
@@ -233,3 +234,58 @@ def prompt_hashes(good_prompts, bad_prompts):
     return {name: hashlib.sha256(json.dumps([asdict(prompt) for prompt in prompts],
                                            sort_keys=True, ensure_ascii=False).encode()).hexdigest()
             for name, prompts in (('edit_train_good', good_prompts), ('edit_train_bad', bad_prompts))}
+
+
+
+def save_replay_reference(snapshot_directory, reference_directory, model, input_ids, attention_mask=None):
+    """Explicit inference reference capture; never called from ARA or an optimizer closure."""
+    from safetensors.torch import load_file, save_file
+
+    if model.training:
+        raise ValueError('Capture references in eval mode')
+    snapshot = Path(snapshot_directory)
+    target = Path(reference_directory)
+    if target.exists():
+        raise FileExistsError(target)
+    data = json.loads((snapshot / 'manifest.json').read_text())
+    if data.get('attention_implementation') != model.config._attn_implementation:
+        raise ValueError('Reference attention implementation mismatch')
+    descriptor = data['files']['adapter.safetensors']
+    if file_record(snapshot / 'adapter.safetensors') != descriptor:
+        raise ValueError('Snapshot adapter hash mismatch')
+    saved = load_file(str(snapshot / 'adapter.safetensors'))
+    current = adapter_state(model)
+    if set(saved) != set(current) or any(not torch.equal(saved[n], current[n]) for n in saved):
+        raise ValueError('Live adapters differ from the referenced snapshot')
+    if base_fingerprint(model) != data['base_state_sha256']:
+        raise ValueError('Live base differs from the referenced snapshot')
+    if input_ids.dtype != torch.long or input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
+        raise ValueError('Expected one nonempty, unpadded int64 token sequence')
+    mask = torch.ones_like(input_ids) if attention_mask is None else attention_mask
+    if mask.shape != input_ids.shape or not torch.all(mask == 1):
+        raise ValueError('Only unpadded references are supported')
+    with torch.inference_mode():
+        logits = model(input_ids=input_ids.to(model.device), attention_mask=mask.to(model.device),
+                       use_cache=False).logits[0, -1].detach().float().cpu()
+    if not torch.isfinite(logits).all():
+        raise ValueError('Nonfinite reference logits')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix='.' + target.name + '-', dir=target.parent))
+    try:
+        save_file({'input_ids': input_ids.detach().cpu().contiguous(),
+                   'attention_mask': mask.detach().cpu().contiguous(), 'logits': logits.contiguous()},
+                  str(staging / 'reference.safetensors'))
+        with (staging / 'reference.safetensors').open('rb') as stream:
+            os.fsync(stream.fileno())
+        manifest = {'schema_version': 1, 'artifact_type': 'replay_reference',
+                    'synthetic': data['synthetic'], 'run_id': data['run_id'], 'trial_id': data['trial_id'],
+                    'snapshot_id': data['snapshot_id'], 'creation_time_utc': utc_now(),
+                    'snapshot_manifest_sha256': hashlib.sha256((snapshot / 'manifest.json').read_bytes()).hexdigest(),
+                    'output_definition': 'last_token_logits_unpadded_use_cache_false',
+                    'files': {'reference.safetensors': file_record(staging / 'reference.safetensors')}}
+        write_json(staging / 'manifest.json', manifest)
+        os.rename(staging, target)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+    return target

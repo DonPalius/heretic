@@ -33,7 +33,7 @@ class Toy(torch.nn.Module):
         super().__init__()
         self.layers = torch.nn.ModuleList([Layer(), Layer()])
         self.device = torch.device('cpu')
-        self.config = SimpleNamespace(_commit_hash='d' * 40, to_dict=lambda: {'architecture': 'test_linear_lora'})
+        self.config = SimpleNamespace(_attn_implementation='eager', _commit_hash='d' * 40, to_dict=lambda: {'architecture': 'test_linear_lora'})
 
     def forward(self, x):
         for layer in self.layers:

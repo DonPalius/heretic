@@ -89,6 +89,7 @@ def setup_trial(tmp_path, monkeypatch, enabled):
                                _research_trial=(0, parameters), _research_dataset_hashes=hashes)
     ctx = SimpleNamespace(get_model=lambda: wrapper,
                           settings=SimpleNamespace(quantization='none', model_commit='d' * 40, seed=21, model='synthetic/test'))
+    modifier.heretic_settings = ctx.settings
     return toy, modifier, ctx, parameters, inputs
 
 

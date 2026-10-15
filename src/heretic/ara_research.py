@@ -152,15 +152,16 @@ def record_trial(modifier, ctx, parameters):
             or trial[0] != settings.research_trial):
         yield None
         return
+    heretic_settings = modifier.heretic_settings
     import safetensors.torch  # Fail before optimization if unavailable.
 
     model = ctx.get_model()
-    if str(ctx.settings.quantization) not in ('none', 'QuantizationMethod.NONE'):
+    if str(heretic_settings.quantization) not in ('none', 'QuantizationMethod.NONE'):
         raise ValueError('PR-02 currently records only unquantized models')
-    revision = ctx.settings.model_commit
+    revision = heretic_settings.model_commit
     if not isinstance(revision, str) or not re.fullmatch('[0-9a-f]{40}', revision):
         raise ValueError('Research recording requires an exact model_commit SHA')
-    if type(ctx.settings.seed) is not int:
+    if type(heretic_settings.seed) is not int:
         raise ValueError('Research recording requires an explicit seed')
     count = sum(len(modules) for layer in range(parameters.start_layer_index, parameters.end_layer_index)
                 for modules in model.get_layer_modules(layer).values())
@@ -195,12 +196,12 @@ def record_trial(modifier, ctx, parameters):
               'heretic_source_diff_sha256': hashlib.sha256(changes.encode()).hexdigest(),
               'research_source_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               'ara_source_sha256': hashlib.sha256((Path(__file__).parent / 'modifiers/ara.py').read_bytes()).hexdigest(),
-              'model_id': ctx.settings.model, 'model_revision': revision,
+              'model_id': heretic_settings.model, 'model_revision': revision,
               'tokenizer_revision': metadata['tokenizer_revision'],
               'chat_template_sha256': hashlib.sha256(model.tokenizer.chat_template.encode()).hexdigest(),
               'dataset_hashes': modifier._research_dataset_hashes,
               'dataset_hash_definition': 'sha256 of UTF-8 json.dumps ordered Prompt records, sort_keys=True, ensure_ascii=False',
-              'seed': ctx.settings.seed,
+              'seed': heretic_settings.seed,
               'versions': {'python': platform.python_version(), 'torch': torch.__version__,
                            'transformers': importlib.metadata.version('transformers'),
                            'peft': importlib.metadata.version('peft')},
@@ -220,7 +221,7 @@ def record_trial(modifier, ctx, parameters):
               'sequence': 0, 'boundary': {'kind': 'trial_start', 'module_id': None,
                                         'outer_step': 0, 'completed_modules': []}}
     from .ara_audit import prepare_audit
-    audit_metadata = dict(metadata, model_id=ctx.settings.model)
+    audit_metadata = dict(metadata, model_id=heretic_settings.model)
     record['audit'] = prepare_audit(settings, model, audit_metadata, parameters)
     record['directory'].mkdir(parents=True)
     write_json(root / 'manifest.json', dict(common, artifact_type='run'))

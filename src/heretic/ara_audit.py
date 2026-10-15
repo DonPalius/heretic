@@ -24,7 +24,16 @@ def prepare_audit(settings, wrapper, metadata, parameters):
     if not modules or input_path is None or len(set(modules)) != len(modules):
         raise ValueError('Audit requires unique modules and research_reference_inputs')
     model = wrapper.model
-    if model.config.model_type != 'qwen2' or getattr(model.config, 'rope_scaling', None) is not None:
+    rope = getattr(model.config, 'rope_scaling', None)
+    static_rope = (
+        rope is None
+        or (
+            isinstance(rope, dict)
+            and rope.get('rope_type') == 'default'
+            and set(rope) <= {'rope_type', 'rope_theta'}
+        )
+    )
+    if model.config.model_type != 'qwen2' or not static_rope:
         raise ValueError('PR-04 capture supports Qwen2 with static RoPE only')
     path = Path(input_path)
     content = path.read_bytes()

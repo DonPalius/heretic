@@ -62,6 +62,7 @@ def trial(root, recording, normalize):
     context = SimpleNamespace(get_model=lambda:wrapper,
                               settings=SimpleNamespace(quantization='none',model_commit='d'*40,
                                                        seed=19,model='synthetic/qwen2'))
+    modifier.heretic_settings = context.settings
     return model,modifier,context,parameters,path
 
 

@@ -57,6 +57,9 @@ class Settings(BaseModel):
     research_trial: int = Field(default=0, ge=0, description="Zero-based Optuna trial number to record.")
     research_intermediate_module: int = Field(default=1, ge=1, description="Save intermediate after this many completed modules.")
 
+    research_audit_modules: list[str] = Field(default_factory=list, description="Opt-in selected Linear modules for PR-04 audit.")
+    research_reference_inputs: str | None = Field(default=None, description="Approved safetensors token input for automatic snapshot references.")
+
     good_prompts: DatasetSpecification = Field(
         default=SingleDatasetSpecification(
             dataset="mlabonne/harmless_alpaca",

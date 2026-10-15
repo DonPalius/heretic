@@ -128,8 +128,57 @@ all adapters and attention backend, then atomically saves token IDs/mask plus
 last-token full-vocabulary float32 logits (use_cache=False), bound to the exact
 snapshot manifest SHA. An already updated model is rejected.
 
-This helper is not called by ARA recording or within the closure. Intermediate
-references require access to the corresponding live boundary; references from
+PR-03 alone does not schedule this helper. PR-04 can now call it automatically
+at every recorded boundary; it is never called within the closure. References from
 the consumer's own replay are not independent evidence. Artifacts include token
 IDs, so use approved inputs. Lab commands and numerical acceptance are in its
 README and docs/PR03_REPORT.md. No pretrained reference was captured here.
+
+
+## PR-04: optional objective/inference observations
+
+Add to the existing `[modifier.ARA]` settings:
+
+```toml
+research_reference_inputs = "../experiments/pr04_inputs.safetensors"
+research_audit_modules = ["model.layers.12.self_attn.o_proj", "model.layers.12.mlp.down_proj"]
+```
+
+Also include `audit_inputs_sha256` in the existing provenance JSON. Prepare that
+safe input with Guardrails Lab's `scripts/pr04_02_inputs.sh`, using exactly the
+same model/tokenizer commit and chat template. Selected modules must be inside
+the actual trial's selected ARA range; otherwise recording fails before updates.
+
+The full four-step instructions, including configuration prerequisites, live in
+Guardrails Lab `docs/OBJECTIVE_INFERENCE_CONSISTENCY.md`. No Lab runtime import
+is introduced. From this Heretic root, with its separate environment ready:
+
+```bash
+bash scripts/pr04_03_record.sh --check
+CUDA_VISIBLE_DEVICES=0 bash scripts/pr04_03_record.sh
+```
+
+This launcher requires one explicitly configured trial, a fixed seed and commit,
+new separate study/recording directories, and no runtime settings overrides.
+It validates first; `--check` exits before launching Heretic. Default HF access
+is cache-only; `--download` explicitly allows missing model/dataset assets.
+It does not select datasets or optimization parameters. Standard Heretic
+interaction remains in effect.
+
+At `s000`, `s001` and `final`, `audit_profile="objective-inference-v1"` snapshots
+include `reference/` (exact input tokens/mask and live last-token full-vocabulary
+logits) and `audit/` (selected base/objective/live/merged weights and native module
+forwards on a fixed two-row linear probe). All tensors are safetensors and bound
+by SHA256 to versioned JSON metadata; child files publish with their snapshot.
+The objective is reconstructed from the pinned formula at the boundary, not
+captured inside an optimizer closure. Row normalization and bias participation
+are reported explicitly. Probes are not prompt activations.
+
+Capture preserves Torch RNG, mixed training flags and buffers in a `finally`
+context, uses disposable module copies for delta/merge, and installs no hooks.
+Only Qwen2 static RoPE, unquantized ordinary LoRA without offloaded/dispatched
+selected modules is supported. No objective, closure, update order or optimizer
+settings change. Additional CPU tests are in `tests/test_ara_audit.py`; together
+with `tests/test_ara_research.py`, 13 producer tests passed in the joint Lab test
+run. Full Heretic-runtime, cross-version and pretrained/A100 acceptance are
+still pending. Historical PR02_VALIDATION_REPORT.md remains unchanged.

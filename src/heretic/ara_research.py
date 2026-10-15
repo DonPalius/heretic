@@ -97,7 +97,12 @@ def save_snapshot(record, snapshot_id, checkpoint_kind):
                                  'tensors': {name: {'file': filename, 'shape': list(value.shape),
                                                     'dtype': str(value.dtype).removeprefix('torch.')}
                                              for name, value in tensors.items()}})
+        if record.get('audit') is not None:
+            manifest['audit_profile'] = 'objective-inference-v1'
         write_json(staging / 'manifest.json', manifest)
+        if record.get('audit') is not None:
+            from .ara_audit import capture_audit
+            capture_audit(record, staging)
         os.rename(staging, target)
     finally:
         if staging.exists():
@@ -214,6 +219,9 @@ def record_trial(modifier, ctx, parameters):
               'adapter_names': set(adapter_state(model.model)), 'intermediate_module': settings.research_intermediate_module,
               'sequence': 0, 'boundary': {'kind': 'trial_start', 'module_id': None,
                                         'outer_step': 0, 'completed_modules': []}}
+    from .ara_audit import prepare_audit
+    audit_metadata = dict(metadata, model_id=ctx.settings.model)
+    record['audit'] = prepare_audit(settings, model, audit_metadata, parameters)
     record['directory'].mkdir(parents=True)
     write_json(root / 'manifest.json', dict(common, artifact_type='run'))
     try:
